@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # OFFLINK - Offline Peer-to-Peer Communication App
 
 A Flutter mobile application that enables device-to-device messaging and file sharing without internet or cellular signals using Bluetooth Low Energy (BLE) and Wi-Fi Direct.
@@ -83,3 +84,7 @@ The app is configured for Android with:
 
 
 
+=======
+# OffLink
+Offline Wireless Communication and Emergency App (Final Year Project)
+>>>>>>> faf72032605968f8527137e80b807fcd01964dd3
