@@ -33,9 +33,10 @@ class MainActivity : FlutterActivity() {
                     "initialize" -> {
                         val serviceUuid = call.argument<String>("serviceUuid")
                         val characteristicUuid = call.argument<String>("characteristicUuid")
+                        val deviceUuid = call.argument<String>("deviceUuid")
                         val initialized =
                             if (serviceUuid != null && characteristicUuid != null) {
-                                blePeripheralManager.initialize(serviceUuid, characteristicUuid)
+                                blePeripheralManager.initialize(serviceUuid, characteristicUuid, deviceUuid)
                             } else {
                                 false
                             }

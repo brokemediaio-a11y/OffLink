@@ -174,39 +174,24 @@ class ChatNotifier extends StateNotifier<ChatState> {
         final discoveredDevices = _ref.read(deviceProvider).discoveredDevices;
         Logger.info('Found ${discoveredDevices.length} devices during scan');
         
-        // Find the target device - try multiple matching strategies
+        // Find the target device by UUID only
+        // receiverId should always be a UUID now
         DeviceModel? foundDevice;
         for (final d in discoveredDevices) {
-          Logger.debug('Checking device: id=${d.id}, address=${d.address}, name=${d.name}');
+          Logger.debug('Checking device: id=${d.id} (UUID), address=${d.address} (MAC), name=${d.name}');
           
-          // Match by receiverId (could be UUID or MAC)
-          if (d.id == receiverId || d.address == receiverId) {
+          // Match by UUID (receiverId should be UUID)
+          if (d.id == receiverId) {
             foundDevice = d;
-            Logger.info('Matched device by receiverId: ${d.name}');
+            Logger.info('Matched device by UUID: ${d.name}');
             break;
           }
           
-          // If we have device info, try matching by id or address
+          // If we have device info, try matching by UUID
           final targetDevice = device ?? _otherDevice;
-          if (targetDevice != null) {
-            // Match by target device id or address
-            if (d.id == targetDevice.id || d.address == targetDevice.address) {
-              foundDevice = d;
-              Logger.info('Matched device by target device info: ${d.name}');
-              break;
-            }
-            // If target device has UUID as address, try matching by discovered device's id
-            if (!targetDevice.address.contains(':') && d.id == targetDevice.address) {
-              foundDevice = d;
-              Logger.info('Matched device by UUID: ${d.name}');
-              break;
-            }
-          }
-          
-          // If receiverId looks like MAC address, match by address
-          if (receiverId.contains(':') && receiverId.length == 17 && d.address == receiverId) {
+          if (targetDevice != null && d.id == targetDevice.id) {
             foundDevice = d;
-            Logger.info('Matched device by MAC address: ${d.name}');
+            Logger.info('Matched device by target device UUID: ${d.name}');
             break;
           }
         }
@@ -267,7 +252,10 @@ class ChatNotifier extends StateNotifier<ChatState> {
 
       // Update conversations list
       try {
-        _ref.read(conversationsProvider.notifier).updateConversation(message, _otherDeviceId);
+        // Get stored name for the receiver, or use device name
+        final storedName = DeviceStorage.getDeviceDisplayName(finalReceiverId);
+        final deviceName = storedName ?? finalReceiverId;
+        _ref.read(conversationsProvider.notifier).updateConversation(message, deviceName);
       } catch (e) {
         Logger.error('Error updating conversations', e);
       }
@@ -399,7 +387,6 @@ class ChatNotifier extends StateNotifier<ChatState> {
       Logger.info('Message matching check: receiverId=${message.receiverId}, senderId=${message.senderId}, _otherDeviceId=$_otherDeviceId, isSent=${message.isSent}');
       Logger.info('  - receiverMatchesOtherDevice: $receiverMatchesOtherDevice');
       Logger.info('  - senderMatchesOtherDevice: $senderMatchesOtherDevice');
-      Logger.info('  - receiverIdIsMacAddress: $receiverIdIsMacAddress');
       Logger.info('  - isForThisConversation: $isForThisConversation');
       
       if (!isForThisConversation) {

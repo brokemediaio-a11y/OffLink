@@ -6,9 +6,11 @@ import '../../core/constants.dart';
 import '../../models/device_model.dart';
 import '../../providers/device_provider.dart';
 import '../../providers/connection_provider.dart';
+import '../../services/communication/connection_manager.dart';
 import '../chat/chat_screen.dart';
 import '../connection/connection_status_screen.dart';
 import '../messages/messages_screen.dart';
+import '../settings/edit_name_dialog.dart';
 
 class HomeScreen extends ConsumerStatefulWidget {
   const HomeScreen({super.key});
@@ -91,6 +93,22 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         backgroundColor: AppColors.primary,
         foregroundColor: AppColors.textLight,
         actions: [
+          IconButton(
+            icon: const Icon(Icons.edit),
+            tooltip: 'Edit Device Name',
+            onPressed: () async {
+              final result = await showDialog<bool>(
+                context: context,
+                builder: (_) => const EditNameDialog(),
+              );
+              
+              if (result == true && mounted) {
+                // Restart advertising with new name
+                final connectionManager = ConnectionManager();
+                await connectionManager.restartAdvertising();
+              }
+            },
+          ),
           IconButton(
             icon: Stack(
               children: [

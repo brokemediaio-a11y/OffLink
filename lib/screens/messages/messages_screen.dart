@@ -8,6 +8,7 @@ import '../../models/conversation_model.dart';
 import '../../providers/conversations_provider.dart';
 import '../../providers/connection_provider.dart';
 import '../../providers/device_provider.dart';
+import '../../services/storage/device_storage.dart';
 import '../../utils/logger.dart';
 import '../chat/chat_screen.dart';
 
@@ -86,10 +87,14 @@ class _MessagesScreenState extends ConsumerState<MessagesScreen> {
                           // Mark as read
                           ref.read(conversationsProvider.notifier).markAsRead(conversation.deviceId);
                           
+                          // Get stored device name or use conversation device name
+                          final storedName = DeviceStorage.getDeviceDisplayName(conversation.deviceId);
+                          final displayName = storedName ?? (conversation.deviceName != conversation.deviceId ? conversation.deviceName : conversation.deviceId);
+                          
                           // Create device model
                           final device = DeviceModel(
                             id: conversation.deviceId,
-                            name: conversation.deviceName,
+                            name: displayName,
                             address: conversation.deviceId,
                             type: DeviceType.ble,
                             rssi: 0,
@@ -237,13 +242,12 @@ class _MessagesScreenState extends ConsumerState<MessagesScreen> {
                                     Logger.warning('Error refreshing conversations: $e');
                                   }
                                   
-                                  // IMPORTANT: Create a DeviceModel using the conversation's deviceId (UUID from received message)
-                                  // This ensures we use the same device ID format that was used when the message was received
-                                  // The foundDevice might have a MAC address, but we need to use the UUID from the conversation
+                                  // Create a DeviceModel using the conversation's deviceId (UUID)
+                                  // This ensures we use UUID for chat identification
                                   final chatDevice = DeviceModel(
-                                    id: conversation.deviceId, // Use conversation's deviceId (UUID from received message)
+                                    id: conversation.deviceId, // Use conversation's deviceId (UUID)
                                     name: foundDevice.name,
-                                    address: foundDevice.address,
+                                    address: foundDevice.address, // Keep MAC for BLE connection
                                     type: foundDevice.type,
                                     rssi: foundDevice.rssi,
                                     isConnected: true,

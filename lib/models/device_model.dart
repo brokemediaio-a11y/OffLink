@@ -1,7 +1,7 @@
 class DeviceModel {
-  final String id;
+  final String id; // Device UUID (primary identifier)
   final String name;
-  final String address;
+  final String? address; // MAC address (optional, only for BLE connection purposes)
   final DeviceType type;
   final int rssi;
   final bool isConnected;
@@ -10,7 +10,7 @@ class DeviceModel {
   DeviceModel({
     required this.id,
     required this.name,
-    required this.address,
+    this.address, // Optional - only needed for BLE connections
     required this.type,
     this.rssi = 0,
     this.isConnected = false,
@@ -41,7 +41,7 @@ class DeviceModel {
     return {
       'id': id,
       'name': name,
-      'address': address,
+      'address': address, // May be null
       'type': type.name,
       'rssi': rssi,
       'isConnected': isConnected,
@@ -53,7 +53,7 @@ class DeviceModel {
     return DeviceModel(
       id: json['id'] as String,
       name: json['name'] as String,
-      address: json['address'] as String,
+      address: json['address'] as String?, // Optional
       type: DeviceType.values.firstWhere(
         (e) => e.name == json['type'],
         orElse: () => DeviceType.ble,

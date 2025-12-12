@@ -4,6 +4,7 @@ import '../../models/device_model.dart';
 import '../../core/constants.dart';
 import '../../utils/logger.dart';
 import '../storage/scan_log_storage.dart';
+import '../storage/device_storage.dart';
 
 class BluetoothService {
   static final BluetoothService _instance = BluetoothService._internal();
@@ -180,12 +181,12 @@ class BluetoothService {
   }
 
   // Extracted method to process scan results
-  void _processScanResults(List<fbp.ScanResult> results, String targetServiceUuid) {
+  Future<void> _processScanResults(List<fbp.ScanResult> results, String targetServiceUuid) async {
     _totalScanResultsReceived += results.length;
     Logger.debug('Scan results received: ${results.length} devices');
     
     for (var result in results) {
-      final deviceId = result.device.remoteId.str;
+      final macAddress = result.device.remoteId.str; // MAC address for connection
       final deviceName = result.device.platformName.isNotEmpty
           ? result.device.platformName
           : 'Unknown Device';
@@ -194,27 +195,100 @@ class BluetoothService {
           .map((u) => u.str.toUpperCase())
           .toList();
       
+      // Extract device UUID from manufacturer data (manufacturer ID 0xFFFF)
+      // Format: 16 bytes representing the UUID (big-endian, MSB first, then LSB)
+      String? deviceUuid;
+      try {
+        final manufacturerData = result.advertisementData.manufacturerData;
+        if (manufacturerData.containsKey(0xFFFF)) {
+          final uuidBytes = manufacturerData[0xFFFF]!;
+          if (uuidBytes.length >= 16) {
+            // Extract 16-byte UUID
+            final uuidBytesList = uuidBytes.sublist(0, 16);
+            
+            // Convert bytes to two 64-bit integers (MSB and LSB)
+            // Match Kotlin implementation: bytes are in big-endian order
+            // byte 0 (MSB[63:56]) shifted left by 56 bits, byte 7 (MSB[7:0]) shifted left by 0 bits
+            int msb = 0;
+            int lsb = 0;
+            for (int i = 0; i < 8; i++) {
+              msb = msb | ((uuidBytesList[i] & 0xFF) << (56 - (i * 8)));
+            }
+            for (int i = 0; i < 8; i++) {
+              lsb = lsb | ((uuidBytesList[8 + i] & 0xFF) << (56 - (i * 8)));
+            }
+            
+            // Convert to UUID string format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+            // UUID layout: MSB[63:32]=time_low, MSB[31:16]=time_mid, MSB[15:0]=time_hi_and_version
+            // LSB[63:56]=clock_seq_hi_and_reserved, LSB[55:48]=clock_seq_low, LSB[47:0]=node
+            final timeLow = (msb >> 32) & 0xFFFFFFFF;
+            final timeMid = (msb >> 16) & 0xFFFF;
+            final timeHiAndVersion = msb & 0xFFFF;
+            final clockSeqHiAndReserved = (lsb >> 56) & 0xFF;
+            final clockSeqLow = (lsb >> 48) & 0xFF;
+            final node = lsb & 0xFFFFFFFFFFFF;
+            
+            // Format as UUID string (lowercase)
+            deviceUuid = '${timeLow.toRadixString(16).padLeft(8, '0')}-'
+                '${timeMid.toRadixString(16).padLeft(4, '0')}-'
+                '${timeHiAndVersion.toRadixString(16).padLeft(4, '0')}-'
+                '${clockSeqHiAndReserved.toRadixString(16).padLeft(2, '0')}'
+                '${clockSeqLow.toRadixString(16).padLeft(2, '0')}-'
+                '${node.toRadixString(16).padLeft(12, '0')}'.toLowerCase();
+            
+            Logger.debug('Extracted UUID from FBP manufacturer data: $deviceUuid');
+          }
+        }
+      } catch (e) {
+        Logger.debug('Could not extract UUID from advertisement: $e');
+      }
+      
+      // Use UUID if extracted, otherwise fallback to MAC address
+      final deviceId = deviceUuid ?? macAddress;
+      
+      // Check if we have a stored name for this device first
+      final storedName = DeviceStorage.getDeviceDisplayName(deviceId);
+      String displayName = storedName ?? deviceName;
+      
+      // Store the device name if we got a proper name (not "Unknown Device", not empty, not just UUID/MAC)
+      if (deviceUuid != null && 
+          deviceName.isNotEmpty && 
+          deviceName != 'Unknown Device' && 
+          deviceName != deviceUuid && 
+          deviceName != macAddress &&
+          !deviceUuid.contains(':') && // Only for UUID-based IDs
+          storedName == null) {
+        unawaited(DeviceStorage.setDeviceDisplayName(deviceUuid, deviceName));
+        displayName = deviceName; // Use the discovered name immediately
+        Logger.debug('Storing discovered device name: $deviceUuid -> $deviceName');
+      }
+      
       Logger.debug(
-        'BLE scan result: id=$deviceId name=$deviceName rssi=${result.rssi} '
+        'BLE scan result: id=$deviceId (MAC: $macAddress) name=$displayName rssi=${result.rssi} '
         'serviceUuids=$serviceUuids',
       );
 
       final device = DeviceModel(
-        id: deviceId,
-        name: deviceName,
-        address: deviceId,
+        id: deviceId, // Will be UUID if extracted, otherwise MAC
+        name: displayName, // Use stored name or discovered name
+        address: macAddress, // Keep MAC for BLE connection (required by flutter_blue_plus)
         type: DeviceType.ble,
         rssi: result.rssi,
         lastSeen: DateTime.now(),
       );
 
+      // Match by manufacturer data (UUID in 0xFFFF) or device name or service UUID
+      // Since we removed device name and service UUID from advertisement to save space,
+      // primary matching is now by manufacturer data containing UUID
+      final matchesByManufacturerData = deviceUuid != null;
       final matchesTargetService = serviceUuids.contains(targetServiceUuid);
-      final matchesByName = deviceName.toLowerCase().startsWith('offlink');
+      final matchesByName = displayName.toLowerCase().startsWith('offlink') || 
+                           deviceName.toLowerCase().startsWith('offlink');
       
-      if (matchesTargetService || matchesByName) {
+      if (matchesByManufacturerData || matchesTargetService || matchesByName) {
         _discoveredDevices[device.id] = device;
         _deviceController.add(_discoveredDevices.values.toList());
-        Logger.info('Found Offlink device: $deviceName (${device.id})');
+        Logger.info('Found Offlink device: $displayName (UUID: ${device.id}, MAC: $macAddress)');
       }
     }
   }
@@ -264,11 +338,18 @@ class BluetoothService {
         }
       }
       
-      final bluetoothDevice = fbp.BluetoothDevice.fromId(device.address);
+      // For BLE connections, we need MAC address
+      // If address is null, use id (which should be MAC in legacy cases)
+      final connectionAddress = device.address ?? device.id;
+      if (connectionAddress.isEmpty) {
+        Logger.error('Cannot connect: device has no MAC address');
+        return false;
+      }
+      final bluetoothDevice = fbp.BluetoothDevice.fromId(connectionAddress);
 
       // Connect to device
-      Logger.info('Attempting to connect to ${device.name} (${device.address})');
-      print('[OFFLINK] Attempting to connect to ${device.name} (${device.address})');
+      Logger.info('Attempting to connect to ${device.name} (UUID: ${device.id}, MAC: $connectionAddress)');
+      print('[OFFLINK] Attempting to connect to ${device.name} ($connectionAddress)');
       await bluetoothDevice.connect(
         timeout: AppConstants.connectionTimeout,
         autoConnect: false,
@@ -521,17 +602,52 @@ class BluetoothService {
   DeviceModel? getConnectedDevice() {
     if (_connectedDevice == null) return null;
     
-    // Get the actual device name
-    final deviceName = _connectedDevice!.platformName.isNotEmpty
+    // Get the actual device name from platform
+    final platformName = _connectedDevice!.platformName.isNotEmpty
         ? _connectedDevice!.platformName
-        : 'Offlink Device'; // Fallback name
+        : 'Unknown Device';
     
-    return DeviceModel(
-      id: _connectedDevice!.remoteId.str,
-      name: deviceName,
-      address: _connectedDevice!.remoteId.str,
-      type: DeviceType.ble,
+    final macAddress = _connectedDevice!.remoteId.str;
+    
+    // Try to find the device in discovered devices to get UUID
+    // If not found, use MAC as ID (legacy fallback)
+    DeviceModel discoveredDevice;
+    try {
+      discoveredDevice = _discoveredDevices.values.firstWhere(
+        (d) => d.address == macAddress,
+      );
+    } catch (e) {
+      // Device not in discovered list, create a new one
+      discoveredDevice = DeviceModel(
+        id: macAddress, // Fallback to MAC if UUID not found
+        name: platformName,
+        address: macAddress,
+        type: DeviceType.ble,
+        isConnected: true,
+      );
+    }
+    
+    // Use stored name if available, otherwise use platform name, otherwise use discovered device name
+    final deviceId = discoveredDevice.id;
+    final storedName = DeviceStorage.getDeviceDisplayName(deviceId);
+    final finalDeviceName = storedName ?? 
+                           (platformName != 'Unknown Device' && platformName.isNotEmpty && platformName != deviceId ? platformName : discoveredDevice.name);
+    
+    // Store the device name if we got a proper name from platform and it's different
+    if (platformName.isNotEmpty && 
+        platformName != 'Unknown Device' && 
+        platformName != deviceId &&
+        platformName != macAddress &&
+        !deviceId.contains(':') && // Only for UUID-based IDs
+        storedName == null) {
+      unawaited(DeviceStorage.setDeviceDisplayName(deviceId, platformName));
+      Logger.info('Storing device name from platform after connection: $deviceId -> $platformName');
+    }
+    
+    // Return connected device model with updated connection status and name
+    return discoveredDevice.copyWith(
       isConnected: true,
+      name: finalDeviceName, // Use stored name or platform name
     );
   }
 

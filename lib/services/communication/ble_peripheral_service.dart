@@ -26,6 +26,7 @@ class BlePeripheralService {
   Future<bool> initialize({
     required String serviceUuid,
     required String characteristicUuid,
+    String? deviceUuid,
   }) async {
     if (!Platform.isAndroid) {
       Logger.warning('BLE peripheral only supported on Android');
@@ -36,6 +37,7 @@ class BlePeripheralService {
       final result = await _channel.invokeMethod<bool>('initialize', {
         'serviceUuid': serviceUuid,
         'characteristicUuid': characteristicUuid,
+        'deviceUuid': deviceUuid,
       });
       
       _initialized = result ?? false;

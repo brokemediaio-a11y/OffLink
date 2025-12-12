@@ -5,6 +5,7 @@ import '../../core/constants.dart';
 import '../../models/device_model.dart';
 import '../../utils/logger.dart';
 import '../storage/scan_log_storage.dart';
+import '../storage/device_storage.dart';
 import 'ble_peripheral_service.dart';
 import 'bluetooth_service.dart';
 import 'wifi_direct_service.dart';
@@ -248,17 +249,41 @@ class ConnectionManager {
     final rssi = result['rssi'] as int? ?? -100;
     
     if (deviceId != null) {
+      // Extract device UUID from scan result (preferred) or use MAC as fallback
+      final deviceUuid = result['deviceUuid'] as String?;
+      final macAddress = result['macAddress'] as String? ?? deviceId;
+      final finalDeviceId = (deviceUuid != null && deviceUuid.isNotEmpty) ? deviceUuid : deviceId;
+      
+      // Check if we have a stored name for this device first
+      final storedName = DeviceStorage.getDeviceDisplayName(finalDeviceId);
+      String displayName = storedName ?? deviceName;
+      
+      // Store the device name if we got a proper name (not "Unknown Device", not empty, not just UUID/MAC)
+      if (deviceUuid != null &&
+          finalDeviceId == deviceUuid && // Only store for UUID-based IDs
+          deviceName.isNotEmpty && 
+          deviceName != 'Unknown Device' && 
+          deviceName != 'Unknown' &&
+          deviceName != finalDeviceId &&
+          deviceName != macAddress &&
+          !finalDeviceId.contains(':') && // Only for UUID-based IDs, not MAC addresses
+          storedName == null) {
+        unawaited(DeviceStorage.setDeviceDisplayName(finalDeviceId, deviceName));
+        displayName = deviceName; // Use the discovered name immediately
+        Logger.info('Storing discovered device name from native scan: $finalDeviceId -> $deviceName');
+      }
+      
       final device = DeviceModel(
-        id: deviceId,
-        name: deviceName,
-        address: deviceId,
+        id: finalDeviceId, // Use UUID if available, otherwise use provided ID
+        name: displayName, // Use stored name or discovered name
+        address: macAddress, // Keep MAC for connection purposes (BLE requires MAC to connect)
         type: DeviceType.ble,
         rssi: rssi,
         lastSeen: DateTime.now(),
       );
       
-      Logger.info('Native scan found device: $deviceName ($deviceId)');
-      _nativeScanDevices[deviceId] = device;
+      Logger.info('Native scan found device: $displayName (UUID: $finalDeviceId, MAC: $macAddress)');
+      _nativeScanDevices[finalDeviceId] = device;
       _emitDiscoveredDevices();
       
       unawaited(_scanLogStorage.logEvent(
@@ -317,7 +342,25 @@ class ConnectionManager {
         connected = await _bluetoothService.connectToDevice(device);
         if (connected) {
           _currentConnectionType = ConnectionType.ble;
-          _connectedDevice = _bluetoothService.getConnectedDevice();
+          final connectedDevice = _bluetoothService.getConnectedDevice();
+          _connectedDevice = connectedDevice;
+          
+          // Store the device name if we got a proper name (not "Unknown Device" and not just the deviceId)
+          if (connectedDevice != null) {
+            final deviceUuid = connectedDevice.id;
+            final deviceName = connectedDevice.name;
+            if (deviceUuid.isNotEmpty && 
+                deviceName.isNotEmpty && 
+                deviceName != 'Unknown Device' && 
+                deviceName != deviceUuid &&
+                !deviceUuid.contains(':')) { // Only store for UUID-based IDs, not MAC addresses
+              final storedName = DeviceStorage.getDeviceDisplayName(deviceUuid);
+              if (storedName == null || storedName == deviceUuid) {
+                unawaited(DeviceStorage.setDeviceDisplayName(deviceUuid, deviceName));
+                Logger.info('Stored device name after connection: $deviceUuid -> $deviceName');
+              }
+            }
+          }
           
           // IMPORTANT: Restart advertising after connecting as central
           // This allows the other device to discover and connect back to us
@@ -435,9 +478,14 @@ class ConnectionManager {
     if (_isAdvertising) return;
     try {
       if (!_peripheralInitialized) {
+        // Get device UUID for inclusion in BLE advertisements
+        final deviceUuid = DeviceStorage.getDeviceId();
+        Logger.info('Initializing BLE peripheral with device UUID: $deviceUuid');
+        
         _peripheralInitialized = await _blePeripheralService.initialize(
           serviceUuid: AppConstants.bleServiceUuid,
           characteristicUuid: AppConstants.bleCharacteristicUuid,
+          deviceUuid: deviceUuid,
         );
         if (_peripheralInitialized && !_peripheralListening) {
           _blePeripheralService.incomingMessages.listen((message) {
@@ -469,6 +517,13 @@ class ConnectionManager {
 
   Future<String> _resolveDeviceName() async {
     try {
+      // First, check if user has set a display name
+      final displayName = DeviceStorage.getDisplayName();
+      if (displayName != null && displayName.isNotEmpty) {
+        return displayName;
+      }
+      
+      // Fallback to device model name
       if (Platform.isAndroid) {
         final info = await DeviceInfoPlugin().androidInfo;
         final model = info.model;
@@ -478,6 +533,27 @@ class ConnectionManager {
     } catch (e) {
       Logger.warning('Unable to resolve device name: $e');
       return 'Offlink Device';
+    }
+  }
+
+  /// Restart advertising with updated device name
+  Future<void> restartAdvertising() async {
+    try {
+      await _stopAdvertising();
+      await Future.delayed(const Duration(milliseconds: 200));
+      await _ensurePeripheralStarted();
+    } catch (e) {
+      Logger.error('Error restarting advertising', e);
+    }
+  }
+
+  /// Stop advertising (private helper)
+  Future<void> _stopAdvertising() async {
+    try {
+      await _blePeripheralService.stopAdvertising();
+      _isAdvertising = false;
+    } catch (e) {
+      Logger.error('Error stopping advertising', e);
     }
   }
 

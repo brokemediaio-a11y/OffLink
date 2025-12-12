@@ -8,6 +8,7 @@ import 'conversations_provider.dart';
 import 'chat_provider.dart';
 import '../models/message_model.dart';
 import '../services/storage/message_storage.dart';
+import '../services/storage/device_storage.dart';
 import 'dart:convert';
 
 class ConnectionProviderState {
@@ -119,12 +120,23 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
       // Save to storage
       MessageStorage.saveMessage(message);
 
-      // Determine device name (use senderId or get from connected device)
-      String deviceName = message.senderId;
-      if (state.connectedDevice != null && 
+      // Determine device name (check stored name first, then connected device, then fallback)
+      final senderId = message.isSent ? message.receiverId : message.senderId;
+      final storedName = DeviceStorage.getDeviceDisplayName(senderId);
+      String deviceName;
+      
+      if (storedName != null && storedName.isNotEmpty) {
+        deviceName = storedName;
+      } else if (state.connectedDevice != null && 
           (state.connectedDevice!.id == message.senderId || 
-           state.connectedDevice!.id == message.receiverId)) {
+           state.connectedDevice!.id == message.receiverId) &&
+          state.connectedDevice!.name != 'Unknown Device' &&
+          state.connectedDevice!.name != senderId) {
         deviceName = state.connectedDevice!.name;
+        // Store the name for future use
+        DeviceStorage.setDeviceDisplayName(senderId, deviceName);
+      } else {
+        deviceName = senderId; // Fallback to deviceId
       }
 
       // Update conversations list
@@ -132,7 +144,6 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
 
       // Try to notify the chat provider for this device if it exists
       // The chat provider is a family provider, so we need the device ID
-      final senderId = message.senderId;
       try {
         // Try to access the chat provider for the sender device
         // If the chat screen is open for this device, the provider will exist

@@ -2,6 +2,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/conversation_model.dart';
 import '../models/message_model.dart';
 import '../services/storage/message_storage.dart';
+import '../services/storage/device_storage.dart';
 import '../utils/logger.dart';
 
 class ConversationsState {
@@ -61,9 +62,13 @@ class ConversationsNotifier extends StateNotifier<ConversationsState> {
         // Count unread messages (messages not sent by us)
         final unreadCount = messages.where((m) => !m.isSent).length;
         
+        // Try to get stored device name, fallback to deviceId
+        final storedName = DeviceStorage.getDeviceDisplayName(deviceId);
+        final displayName = storedName ?? deviceId;
+        
         conversations.add(ConversationModel(
           deviceId: deviceId,
-          deviceName: deviceId, // You might want to store device names separately
+          deviceName: displayName, // Use stored name or deviceId
           lastMessage: lastMessage.content,
           lastMessageTime: lastMessage.timestamp,
           unreadCount: unreadCount,
@@ -88,13 +93,24 @@ class ConversationsNotifier extends StateNotifier<ConversationsState> {
     try {
       final otherDeviceId = message.isSent ? message.receiverId : message.senderId;
       
+      // Try to get stored device name first, then use passed deviceName, then fallback to deviceId
+      final storedName = DeviceStorage.getDeviceDisplayName(otherDeviceId);
+      String finalDeviceName = storedName ?? (deviceName != otherDeviceId && deviceName.isNotEmpty ? deviceName : otherDeviceId);
+      
+      // If we got a proper name and it's not stored yet, store it
+      if (deviceName != otherDeviceId && deviceName.isNotEmpty && deviceName != 'Unknown Device' && storedName == null) {
+        DeviceStorage.setDeviceDisplayName(otherDeviceId, deviceName);
+        finalDeviceName = deviceName;
+      }
+      
       // Add print for immediate visibility in logs
       print('🔵 updateConversation CALLED: senderId=${message.senderId}, receiverId=${message.receiverId}, otherDeviceId=$otherDeviceId');
       print('🔵 Message isSent=${message.isSent}, conversations count=${state.conversations.length}');
+      print('🔵 Device name: stored=$storedName, passed=$deviceName, final=$finalDeviceName');
       
       Logger.info('=== updateConversation called ===');
       Logger.info('Message: isSent=${message.isSent}, senderId=${message.senderId}, receiverId=${message.receiverId}');
-      Logger.info('otherDeviceId: $otherDeviceId');
+      Logger.info('otherDeviceId: $otherDeviceId, finalDeviceName: $finalDeviceName');
       Logger.info('Current conversations: ${state.conversations.length}');
       for (var conv in state.conversations) {
         print('  📋 Conversation: deviceId=${conv.deviceId}, lastMessage=${conv.lastMessage}');
@@ -186,8 +202,126 @@ class ConversationsNotifier extends StateNotifier<ConversationsState> {
       print('🔍 No exact match. Total messages: ${allMessages.length}, Conversations: ${state.conversations.length}');
       Logger.info('Total messages in storage: ${allMessages.length}');
       
+      // CRITICAL FIX: Before complex matching, check ALL existing conversations for message-based matches
+      // This handles multiple scenarios:
+      // 1. Device A sent to Device B, now Device A receives from Device B
+      // 2. Device B received from Device A (created conversation with UUID), now Device B receives with MAC
+      // 3. Any bidirectional message flow between existing conversations and the new message
+      if (existingIndex < 0) {
+        print('🔍 Early matching check: Checking all conversations for message-based matches');
+        
+        // Check ALL conversations to see if we have message history with otherDeviceId
+        for (int i = 0; i < state.conversations.length; i++) {
+          final conv = state.conversations[i];
+          
+          // Check if we have ANY messages (sent or received) between conv.deviceId and otherDeviceId
+          // This catches cases where:
+          // - We received from conv.deviceId and are now receiving from otherDeviceId (same device, different IDs)
+          // - We sent to conv.deviceId and are now receiving from otherDeviceId
+          // - We received from conv.deviceId and are now sending to otherDeviceId
+          
+          final messagesWithConvDevice = allMessages.where((m) =>
+            (m.isSent && m.receiverId == conv.deviceId) || 
+            (!m.isSent && m.senderId == conv.deviceId)
+          ).toList();
+          
+          final messagesWithOtherDevice = allMessages.where((m) =>
+            (m.isSent && m.receiverId == otherDeviceId) || 
+            (!m.isSent && m.senderId == otherDeviceId)
+          ).toList();
+          
+          // Also include the current message if it matches
+          final currentMessageMatches = (message.isSent && message.receiverId == otherDeviceId) ||
+            (!message.isSent && message.senderId == otherDeviceId);
+          if (currentMessageMatches && !messagesWithOtherDevice.any((m) => m.id == message.id)) {
+            messagesWithOtherDevice.add(message);
+          }
+          
+          // Check if we have bidirectional flow or if the new message connects them
+          bool hasConnection = false;
+          
+          if (messagesWithConvDevice.isNotEmpty && messagesWithOtherDevice.isNotEmpty) {
+            // We have messages with both IDs - check if they're related
+            // Look for messages that link the two device IDs together
+            // For example: message sent to conv.deviceId with senderId/receiverId that matches otherDeviceId
+            
+            // Check if we sent to conv.deviceId and received from otherDeviceId
+            final sentToConv = messagesWithConvDevice.any((m) => m.isSent && m.receiverId == conv.deviceId);
+            final receivedFromOther = messagesWithOtherDevice.any((m) => !m.isSent && m.senderId == otherDeviceId);
+            
+            // Check if we received from conv.deviceId and sent to otherDeviceId  
+            final receivedFromConv = messagesWithConvDevice.any((m) => !m.isSent && m.senderId == conv.deviceId);
+            final sentToOther = messagesWithOtherDevice.any((m) => m.isSent && m.receiverId == otherDeviceId);
+            
+            // If we have bidirectional flow or the new message creates a connection, they're the same device
+            if ((sentToConv && receivedFromOther) || (receivedFromConv && sentToOther)) {
+              hasConnection = true;
+            }
+            
+            // Also check if the current message itself creates the connection
+            if (!hasConnection) {
+              if (message.isSent && message.receiverId == otherDeviceId && receivedFromConv) {
+                hasConnection = true;
+              } else if (!message.isSent && message.senderId == otherDeviceId && sentToConv) {
+                hasConnection = true;
+              }
+            }
+            } else if (messagesWithConvDevice.isNotEmpty) {
+            // We have history with conv.deviceId but not with otherDeviceId yet
+            // Check if the new message creates a connection
+            // This is the KEY SCENARIO: Device B received from Device A (UUID), now receiving from Device A (MAC)
+            
+            final receivedFromConv = messagesWithConvDevice.any((m) => !m.isSent && m.senderId == conv.deviceId);
+            final sentToConv = messagesWithConvDevice.any((m) => m.isSent && m.receiverId == conv.deviceId);
+            
+            if (!message.isSent && message.senderId == otherDeviceId) {
+              // We're receiving from otherDeviceId - check if we previously received from conv.deviceId
+              // and they might be the same device (different ID formats: UUID vs MAC)
+              
+              if (receivedFromConv) {
+                // We've received from conv.deviceId before
+                // Check if we've sent messages to either - if we've sent to conv.deviceId but not otherDeviceId,
+                // or vice versa, they're likely the same device
+                final sentToOther = allMessages.any((m) => m.isSent && m.receiverId == otherDeviceId);
+                
+                // If we received from conv.deviceId and are now receiving from otherDeviceId,
+                // and we haven't sent to both separately (which would indicate they're different devices),
+                // they're likely the same device with different ID formats
+                if (!sentToConv || !sentToOther || (sentToConv && sentToOther)) {
+                  // Either we haven't sent to either, or we've sent to both - they're likely the same device
+                  hasConnection = true;
+                  print('🔍 Linking: received from ${conv.deviceId}, now receiving from $otherDeviceId (same device, different IDs - UUID vs MAC)');
+                }
+              }
+            } else if (message.isSent && message.receiverId == otherDeviceId) {
+              // We're sending to otherDeviceId - check if we have history with conv.deviceId
+              // If we received from conv.deviceId and are now sending to otherDeviceId,
+              // they might be the same device (we're replying to the conversation)
+              if (receivedFromConv || sentToConv) {
+                // We have history with conv.deviceId - if we're now sending to otherDeviceId,
+                // they're likely the same device (different ID formats)
+                hasConnection = true;
+                print('🔍 Linking: history with ${conv.deviceId}, now sending to $otherDeviceId (replying to conversation)');
+              }
+            }
+          }
+          
+          if (hasConnection) {
+            existingIndex = i;
+            print('✅ MATCHED (Early): Found conversation at index $i by message history');
+            print('✅ conv.deviceId=${conv.deviceId} <-> otherDeviceId=$otherDeviceId (bidirectional flow detected)');
+            Logger.info('✓ MATCHED (Early): Conversation index $i - deviceId=${conv.deviceId} matches otherDeviceId=$otherDeviceId');
+            break;
+          }
+        }
+      }
+      
       // Find if we have any messages with this device (by checking senderId/receiverId)
+      // Only do this if we haven't found a match yet
       String? existingConversationId;
+      
+      // Only run complex matching if we haven't found a match in the early check
+      if (existingIndex < 0) {
       for (final existingConv in state.conversations) {
         print('🔍 Checking conversation: deviceId=${existingConv.deviceId}');
         Logger.info('Checking conversation with deviceId: ${existingConv.deviceId}');
@@ -270,14 +404,30 @@ class ConversationsNotifier extends StateNotifier<ConversationsState> {
           Logger.info('Check 3: sentToExisting=$sentToExisting, receivedFromOther=$receivedFromOther, receivedFromExisting=$receivedFromExisting, sentToOther=$sentToOther');
           
           // If we have messages in both directions (sent to one, received from the other), they're the same device
+          // Improved logic: Check if we sent to existing and are receiving from other (or vice versa)
+          // OR if we sent to other and received from existing
           if ((sentToExisting && receivedFromOther) || (receivedFromExisting && sentToOther)) {
             // Also verify the new message fits this pattern
-            if ((message.isSent && message.receiverId == otherDeviceId && sentToExisting) ||
-                (!message.isSent && message.senderId == otherDeviceId && receivedFromExisting)) {
+            // For receiving: if we sent to existing and are receiving from other, match!
+            // For sending: if we received from existing and are sending to other, match!
+            final messageFitsPattern = 
+                (!message.isSent && message.senderId == otherDeviceId && sentToExisting) ||
+                (message.isSent && message.receiverId == otherDeviceId && receivedFromExisting);
+            
+            if (messageFitsPattern) {
               foundMatch = true;
               print('✅ MATCHED (Check 3): Bidirectional flow between ${existingConv.deviceId} and $otherDeviceId');
               Logger.info('✓ MATCHED (Check 3): Bidirectional flow between ${existingConv.deviceId} and $otherDeviceId');
             }
+          }
+          
+          // Additional check: If we sent messages TO otherDeviceId and this conversation has those messages
+          // This catches the case where conversation.deviceId == otherDeviceId but exact match failed due to format
+          if (!foundMatch && sentToOther && existingConv.deviceId == otherDeviceId) {
+            foundMatch = true;
+            existingIndex = state.conversations.indexOf(existingConv);
+            print('✅ MATCHED (Check 3b): Direct match - sent to otherDeviceId matches conversation deviceId');
+            Logger.info('✓ MATCHED (Check 3b): Direct match found');
           }
         }
         
@@ -318,15 +468,17 @@ class ConversationsNotifier extends StateNotifier<ConversationsState> {
           Logger.info('✗ No match found for conversation with deviceId: ${existingConv.deviceId}');
         }
       }
+      } // End of if (existingIndex < 0) for complex matching
       
       // If we found an existing conversation, use it
-      if (existingConversationId != null) {
+      if (existingConversationId != null && existingIndex < 0) {
         existingIndex = state.conversations.indexWhere(
           (c) => c.deviceId == existingConversationId,
         );
         print('✅ Using existing conversation at index: $existingIndex');
         Logger.info('Found existing conversation at index: $existingIndex');
-      } else {
+      } else if (existingIndex < 0) {
+        // Only show warning if we haven't found a match in early check
         print('⚠️ No existing conversation found - will create new one for: $otherDeviceId');
         Logger.warning('No existing conversation found for otherDeviceId: $otherDeviceId');
         Logger.warning('This will create a new conversation');
@@ -386,15 +538,28 @@ class ConversationsNotifier extends StateNotifier<ConversationsState> {
           ? existing.unreadCount 
           : existing.unreadCount + 1;
       
-      // Update deviceId: ALWAYS prefer UUID over MAC address for consistency
-      // This ensures conversations use UUIDs after merging, making matching more reliable
+      // CRITICAL FIX: ALWAYS prefer UUID over MAC address for consistency
+      // If we found a match and the conversation has a UUID but the new message has a MAC,
+      // keep the UUID. This ensures all messages use the same conversation.
       final currentIsMAC = existing.deviceId.contains(':');
       final newIsMAC = otherDeviceId.contains(':');
-      final preferredDeviceId = (!newIsMAC) 
-          ? otherDeviceId  // Always use UUID if new message has UUID
-          : ((!currentIsMAC) 
-              ? existing.deviceId  // Keep UUID if current has UUID and new is MAC
-              : otherDeviceId); // If both are MAC, use the new one
+      String preferredDeviceId;
+      
+      if (!currentIsMAC && !newIsMAC) {
+        // Both are UUIDs - keep the existing one (they should match anyway)
+        preferredDeviceId = existing.deviceId;
+      } else if (!currentIsMAC && newIsMAC) {
+        // Current is UUID, new is MAC - keep UUID (prefer existing conversation's ID)
+        preferredDeviceId = existing.deviceId;
+        print('🔧 Keeping UUID from existing conversation: ${existing.deviceId} (ignoring MAC: $otherDeviceId)');
+      } else if (currentIsMAC && !newIsMAC) {
+        // Current is MAC, new is UUID - use UUID (upgrade to UUID)
+        preferredDeviceId = otherDeviceId;
+        print('🔧 Upgrading from MAC to UUID: ${existing.deviceId} -> $otherDeviceId');
+      } else {
+        // Both are MACs - use the existing one to maintain consistency
+        preferredDeviceId = existing.deviceId;
+      }
       
       print('🔧 Updating deviceId: current=${existing.deviceId} (MAC=$currentIsMAC), new=$otherDeviceId (MAC=$newIsMAC), preferred=$preferredDeviceId');
       
@@ -403,7 +568,7 @@ class ConversationsNotifier extends StateNotifier<ConversationsState> {
         lastMessage: message.content,
         lastMessageTime: message.timestamp,
         unreadCount: unreadCount,
-        deviceName: deviceName,
+        deviceName: finalDeviceName,
       );
       
       final updatedList = List<ConversationModel>.from(state.conversations);
@@ -411,25 +576,99 @@ class ConversationsNotifier extends StateNotifier<ConversationsState> {
       updatedList.sort((a, b) => b.lastMessageTime.compareTo(a.lastMessageTime));
       
       state = state.copyWith(conversations: updatedList);
-      print('✅ Conversation updated successfully');
-      Logger.info('Updated existing conversation for device: $otherDeviceId');
+      print('✅ Conversation updated successfully with deviceId: $preferredDeviceId');
+      Logger.info('Updated existing conversation: deviceId changed from ${existing.deviceId} to $preferredDeviceId');
     } else {
-      // Create new conversation
+      // Create new conversation - but first check if we should merge with an existing one
+      // that has a different ID format (MAC vs UUID)
       print('⚠️ Creating NEW conversation for device: $otherDeviceId (no match found)');
-      final newConversation = ConversationModel(
-        deviceId: otherDeviceId,
-        deviceName: deviceName,
-        lastMessage: message.content,
-        lastMessageTime: message.timestamp,
-        unreadCount: message.isSent ? 0 : 1,
-      );
       
-      final updatedList = [newConversation, ...state.conversations];
-      updatedList.sort((a, b) => b.lastMessageTime.compareTo(a.lastMessageTime));
+      // Last check: If otherDeviceId is a MAC address, check if we have a UUID conversation
+      // with bidirectional messages (or vice versa)
+      final otherIsMAC = otherDeviceId.contains(':');
+      String? conversationToMergeId;
       
-      state = state.copyWith(conversations: updatedList);
-      print('⚠️ New conversation created');
-      Logger.info('Created new conversation for device: $otherDeviceId');
+      if (otherIsMAC) {
+        // We're creating a MAC conversation - check if we have a UUID conversation with the same device
+        final allMessages = MessageStorage.getAllMessages();
+        
+        for (final existingConv in state.conversations) {
+          final existingIsMAC = existingConv.deviceId.contains(':');
+          
+          // Only check UUID conversations
+          if (!existingIsMAC) {
+            // Check if we have bidirectional messages between the UUID and this MAC
+            final messagesWithUUID = allMessages.where((m) =>
+              (m.isSent && m.receiverId == existingConv.deviceId) ||
+              (!m.isSent && m.senderId == existingConv.deviceId)
+            ).toList();
+            
+            // Check if we have messages with the MAC (from the current message)
+            final messagesWithMAC = allMessages.where((m) =>
+              (m.isSent && m.receiverId == otherDeviceId) ||
+              (!m.isSent && m.senderId == otherDeviceId)
+            ).toList();
+            
+            // If we have messages with both, they're likely the same device
+            if (messagesWithUUID.isNotEmpty && messagesWithMAC.isNotEmpty) {
+              // Check for bidirectional flow
+              final sentToUUID = messagesWithUUID.any((m) => m.isSent && m.receiverId == existingConv.deviceId);
+              final receivedFromMAC = messagesWithMAC.any((m) => !m.isSent && m.senderId == otherDeviceId);
+              final receivedFromUUID = messagesWithUUID.any((m) => !m.isSent && m.senderId == existingConv.deviceId);
+              final sentToMAC = messagesWithMAC.any((m) => m.isSent && m.receiverId == otherDeviceId);
+              
+              if ((sentToUUID && receivedFromMAC) || (receivedFromUUID && sentToMAC)) {
+                conversationToMergeId = existingConv.deviceId;
+                print('🔗 Found related UUID conversation: ${existingConv.deviceId} - will merge instead of creating new MAC conversation');
+                break;
+              }
+            }
+          }
+        }
+      }
+      
+      if (conversationToMergeId != null) {
+        // Merge with existing conversation instead of creating new one
+        existingIndex = state.conversations.indexWhere((c) => c.deviceId == conversationToMergeId);
+        if (existingIndex >= 0) {
+          final existing = state.conversations[existingIndex];
+          final unreadCount = message.isSent 
+              ? existing.unreadCount 
+              : existing.unreadCount + 1;
+          
+          final updated = existing.copyWith(
+            deviceId: conversationToMergeId, // Keep UUID
+            lastMessage: message.content,
+            lastMessageTime: message.timestamp,
+            unreadCount: unreadCount,
+            deviceName: finalDeviceName,
+          );
+          
+          final updatedList = List<ConversationModel>.from(state.conversations);
+          updatedList[existingIndex] = updated;
+          updatedList.sort((a, b) => b.lastMessageTime.compareTo(a.lastMessageTime));
+          
+          state = state.copyWith(conversations: updatedList);
+          print('✅ Merged into existing UUID conversation at index $existingIndex');
+          Logger.info('Merged MAC conversation ($otherDeviceId) into UUID conversation ($conversationToMergeId)');
+        }
+      } else {
+        // No merge found - create new conversation
+        final newConversation = ConversationModel(
+          deviceId: otherDeviceId,
+          deviceName: finalDeviceName,
+          lastMessage: message.content,
+          lastMessageTime: message.timestamp,
+          unreadCount: message.isSent ? 0 : 1,
+        );
+        
+        final updatedList = [newConversation, ...state.conversations];
+        updatedList.sort((a, b) => b.lastMessageTime.compareTo(a.lastMessageTime));
+        
+        state = state.copyWith(conversations: updatedList);
+        print('⚠️ New conversation created');
+        Logger.info('Created new conversation for device: $otherDeviceId');
+      }
     }
     } catch (e, stackTrace) {
       print('❌ ERROR in updateConversation: $e');

@@ -8,6 +8,7 @@ import '../../models/message_model.dart';
 import '../../providers/chat_provider.dart';
 import '../../providers/connection_provider.dart';
 import '../../providers/device_provider.dart';
+import '../../services/storage/device_storage.dart';
 import '../../utils/logger.dart';
 
 class ChatScreen extends ConsumerStatefulWidget {
@@ -55,20 +56,28 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     // Find the target device - improved matching logic
     DeviceModel? foundDevice;
     
-    // First, try exact matches
+    // First, try exact matches by UUID (primary identifier)
     for (final d in discoveredDevices) {
-      if (d.id == widget.device.id || 
-          d.address == widget.device.id ||
-          d.id == widget.device.address ||
-          d.address == widget.device.address ||
-          d.name == widget.device.name) {
+      if (d.id == widget.device.id) {
         foundDevice = d;
-        Logger.info('Matched device by exact ID/address: ${d.name} (${d.address})');
+        Logger.info('Matched device by UUID: ${d.name} (UUID: ${d.id})');
         break;
       }
     }
     
+    // Fallback: try matching by name if UUID match failed
+    if (foundDevice == null) {
+      for (final d in discoveredDevices) {
+        if (d.name == widget.device.name) {
+          foundDevice = d;
+          Logger.info('Matched device by name: ${d.name} (UUID: ${d.id})');
+          break;
+        }
+      }
+    }
+    
     // If no exact match, try matching by name (especially for "Offlink" devices)
+    // This is a fallback - UUID matching should be primary
     if (foundDevice == null) {
       for (final d in discoveredDevices) {
         if (d.name.toLowerCase().contains('offlink') || 
@@ -78,7 +87,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
               widget.device.name.contains(d.name) ||
               d.name.contains(widget.device.name)) {
             foundDevice = d;
-            Logger.info('Matched device by name (Offlink): ${d.name} (${d.address})');
+            Logger.info('Matched device by name (Offlink): ${d.name} (UUID: ${d.id})');
             break;
           }
         }
@@ -93,20 +102,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       
       if (offlinkDevices.length == 1) {
         foundDevice = offlinkDevices.first;
-        Logger.info('Matched single Offlink device: ${foundDevice.name} (${foundDevice.address})');
-      }
-    }
-    
-    // Last resort: if widget.device.id looks like a MAC address, try matching
-    if (foundDevice == null && 
-        widget.device.id.contains(':') && 
-        widget.device.id.length == 17) {
-      for (final d in discoveredDevices) {
-        if (d.address == widget.device.id || d.id == widget.device.id) {
-          foundDevice = d;
-          Logger.info('Matched device by MAC address: ${d.name} (${d.address})');
-          break;
-        }
+        Logger.info('Matched single Offlink device: ${foundDevice.name} (UUID: ${foundDevice.id})');
       }
     }
     
@@ -203,12 +199,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       });
     }
 
+    // Get stored device name or use device name from widget
+    final storedName = DeviceStorage.getDeviceDisplayName(widget.device.id);
+    final displayName = storedName ?? (widget.device.name != 'Unknown Device' && widget.device.name != widget.device.id ? widget.device.name : widget.device.id);
+
     return Scaffold(
       appBar: AppBar(
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(widget.device.name),
+            Text(displayName),
             Text(
               connectionState.state == ConnectionStateType.connected
                   ? AppStrings.connected

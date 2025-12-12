@@ -45,6 +45,7 @@ class BlePeripheralManager(private val context: Context) {
 
     private var serviceUuid: UUID? = null
     private var characteristicUuid: UUID? = null
+    private var deviceUuid: String? = null // App-generated persistent UUID
 
     private val connectedDevices = CopyOnWriteArraySet<BluetoothDevice>()
 
@@ -75,7 +76,7 @@ class BlePeripheralManager(private val context: Context) {
         scanResultListener = listener
     }
 
-    fun initialize(serviceUuidString: String, characteristicUuidString: String): Boolean {
+    fun initialize(serviceUuidString: String, characteristicUuidString: String, deviceUuidString: String?): Boolean {
         if (!context.packageManager.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE)) {
             Log.w(tag, "BLE not supported")
             return false
@@ -93,6 +94,14 @@ class BlePeripheralManager(private val context: Context) {
         } catch (ex: IllegalArgumentException) {
             Log.e(tag, "Invalid characteristic UUID", ex)
             return false
+        }
+        
+        // Store device UUID for inclusion in advertisements
+        deviceUuid = deviceUuidString
+        if (deviceUuid != null) {
+            Log.d(tag, "Device UUID set: $deviceUuid")
+        } else {
+            Log.w(tag, "Device UUID not provided - advertisements will not include UUID")
         }
 
         bluetoothManager =
@@ -162,8 +171,17 @@ class BlePeripheralManager(private val context: Context) {
             return false
         }
 
+        // Cancel any pending retries
+        advertisingRetryHandler?.removeCallbacksAndMessages(null)
+        
         if (isAdvertising) {
             stopAdvertising()
+            // Wait a bit for advertising to fully stop
+            try {
+                Thread.sleep(100)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
         }
 
         isAdvertising = false
@@ -171,7 +189,7 @@ class BlePeripheralManager(private val context: Context) {
 
         if (!deviceName.isNullOrEmpty()) {
             try {
-                adapter.name = "Offlink"
+                adapter.name = deviceName // Use the passed name instead of hardcoded "Offlink"
                 Log.d(tag, "Device name set to: ${adapter.name}")
             } catch (ex: SecurityException) {
                 Log.w(tag, "Unable to set adapter name", ex)
@@ -184,10 +202,47 @@ class BlePeripheralManager(private val context: Context) {
             .setConnectable(true)
             .build()
 
-        val data = AdvertiseData.Builder()
-            .setIncludeDeviceName(true)
-            .addServiceUuid(ParcelUuid(serviceUuidLocal))
-            .build()
+        // BLE advertisement data limit is 31 bytes total
+        // Device name "Offlink" (7 bytes) + AD structure overhead (2 bytes) = 9 bytes
+        // Manufacturer data: AD type (1 byte) + length (1 byte) + manufacturer ID (2 bytes) + UUID (16 bytes) = 20 bytes
+        // Total: 9 + 20 = 29 bytes - should fit, but some devices have stricter limits
+        // Solution: Remove device name completely, use only manufacturer data
+        // Discovery will work by scanning for manufacturer ID 0xFFFF
+        val dataBuilder = AdvertiseData.Builder()
+            .setIncludeDeviceName(false) // Don't include device name to ensure we fit in 31 bytes
+        
+        // Add device UUID to advertisement data as manufacturer data
+        // Use a custom manufacturer ID (0xFFFF is reserved for testing)
+        // Store UUID in compact format (16 bytes) instead of string (36 bytes) to fit BLE limits
+        if (deviceUuid != null && deviceUuid!!.isNotEmpty()) {
+            try {
+                // Parse UUID string and convert to 16-byte array
+                val uuid = UUID.fromString(deviceUuid)
+                val uuidBytes = ByteArray(16)
+                val msb = uuid.mostSignificantBits
+                val lsb = uuid.leastSignificantBits
+                
+                // Convert long to bytes (most significant first)
+                for (i in 0..7) {
+                    uuidBytes[i] = ((msb shr (56 - i * 8)) and 0xFF).toByte()
+                }
+                for (i in 0..7) {
+                    uuidBytes[8 + i] = ((lsb shr (56 - i * 8)) and 0xFF).toByte()
+                }
+                
+                // Use manufacturer ID 0xFFFF (reserved for testing) to include UUID
+                // addManufacturerData() takes manufacturer ID as first parameter, so data array should only contain UUID
+                // Format: AD type (1) + length (1) + manufacturer ID (2) + UUID (16) = 20 bytes total
+                // This fits comfortably in 31-byte limit
+                // Note: manufacturerData array should NOT include the manufacturer ID bytes
+                dataBuilder.addManufacturerData(0xFFFF, uuidBytes)
+                Log.d(tag, "Added device UUID to advertisement (compact format, no device name): $deviceUuid")
+            } catch (e: Exception) {
+                Log.w(tag, "Failed to add device UUID to advertisement", e)
+            }
+        }
+        
+        val data = dataBuilder.build()
 
         Log.d(tag, "Starting BLE advertising with service UUID: $serviceUuidLocal")
 
@@ -540,21 +595,60 @@ class BlePeripheralManager(private val context: Context) {
         
         val serviceUuids = result.scanRecord?.serviceUuids?.map { it.uuid.toString().uppercase() } ?: emptyList()
         
-        Log.d(tag, "BLE scan result: $deviceName ($deviceAddress) RSSI: $rssi, Services: $serviceUuids")
+        // Extract device UUID from manufacturer data (if present)
+        var extractedDeviceUuid: String? = null
+        val scanRecord = result.scanRecord
+        if (scanRecord != null) {
+            // Check manufacturer data for UUID (manufacturer ID 0xFFFF)
+            val manufacturerData = scanRecord.getManufacturerSpecificData(0xFFFF)
+            if (manufacturerData != null && manufacturerData.size >= 16) {
+                try {
+                    // Extract 16-byte UUID (manufacturerData already contains just the UUID bytes)
+                    val uuidBytes = ByteArray(16)
+                    System.arraycopy(manufacturerData, 0, uuidBytes, 0, 16)
+                    
+                    // Convert 16-byte array back to UUID
+                    var msb: Long = 0
+                    var lsb: Long = 0
+                    for (i in 0..7) {
+                        msb = msb or ((uuidBytes[i].toLong() and 0xFF) shl (56 - i * 8))
+                    }
+                    for (i in 0..7) {
+                        lsb = lsb or ((uuidBytes[8 + i].toLong() and 0xFF) shl (56 - i * 8))
+                    }
+                    val uuid = UUID(msb, lsb)
+                    extractedDeviceUuid = uuid.toString()
+                    Log.d(tag, "Extracted device UUID from advertisement: $extractedDeviceUuid")
+                } catch (e: Exception) {
+                    Log.w(tag, "Failed to extract device UUID from manufacturer data", e)
+                }
+            }
+        }
         
-        val targetServiceUuid = serviceUuid?.toString()?.uppercase()
-        val matchesService = targetServiceUuid != null && serviceUuids.contains(targetServiceUuid)
+        Log.d(tag, "BLE scan result: $deviceName ($deviceAddress) RSSI: $rssi, Services: $serviceUuids, UUID: $extractedDeviceUuid")
+        
+        // Discovery: Check for manufacturer data with our UUID (manufacturer ID 0xFFFF)
+        // Since we removed device name from advertisement to save space, we match by manufacturer data
+        // Service UUID is still available in GATT server for connections
+        val hasOurManufacturerData = extractedDeviceUuid != null
+        
+        // Also check device name as fallback (some devices might still advertise name)
         val matchesName = deviceName.lowercase().startsWith("offlink")
         
-        if (matchesService || matchesName) {
-            Log.d(tag, "Found Offlink device: $deviceName")
+        if (hasOurManufacturerData || matchesName) {
+            Log.d(tag, "Found Offlink device: $deviceName (UUID: $extractedDeviceUuid)")
+            
+            // Use extracted UUID as device ID, fallback to MAC address if UUID not found
+            val deviceId = extractedDeviceUuid ?: deviceAddress
             
             val resultMap = mapOf(
-                "id" to deviceAddress,
+                "id" to deviceId, // Use UUID if available, otherwise MAC
                 "name" to deviceName,
                 "rssi" to rssi,
                 "serviceUuids" to serviceUuids,
-                "matchedBy" to if (matchesService) "serviceUuid" else "name",
+                "deviceUuid" to (extractedDeviceUuid ?: ""), // Include UUID separately for reference
+                "macAddress" to deviceAddress, // Keep MAC for connection purposes
+                "matchedBy" to if (hasOurManufacturerData) "manufacturerData" else "name",
                 "discoveryType" to "ble"
             )
             
@@ -738,18 +832,50 @@ class BlePeripheralManager(private val context: Context) {
         }
     }
 
+    private var advertisingRetryCount = 0
+    private val maxAdvertisingRetries = 5
+    private var advertisingRetryHandler: Handler? = null
+    
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
             super.onStartSuccess(settingsInEffect)
             isAdvertising = true
             advertisingError = null
+            advertisingRetryCount = 0 // Reset retry count on success
+            advertisingRetryHandler?.removeCallbacksAndMessages(null)
             Log.d(tag, "Advertising successfully started")
         }
         override fun onStartFailure(errorCode: Int) {
             super.onStartFailure(errorCode)
             isAdvertising = false
             advertisingError = errorCode
-            Log.e(tag, "Advertising failed: $errorCode")
+            val errorName = when (errorCode) {
+                AdvertiseCallback.ADVERTISE_FAILED_DATA_TOO_LARGE -> "DATA_TOO_LARGE"
+                AdvertiseCallback.ADVERTISE_FAILED_TOO_MANY_ADVERTISERS -> "TOO_MANY_ADVERTISERS"
+                AdvertiseCallback.ADVERTISE_FAILED_ALREADY_STARTED -> "ALREADY_STARTED"
+                AdvertiseCallback.ADVERTISE_FAILED_INTERNAL_ERROR -> "INTERNAL_ERROR"
+                AdvertiseCallback.ADVERTISE_FAILED_FEATURE_UNSUPPORTED -> "FEATURE_UNSUPPORTED"
+                else -> "UNKNOWN($errorCode)"
+            }
+            Log.e(tag, "Advertising failed: $errorName ($errorCode)")
+            
+            // Retry advertising after a delay
+            if (advertisingRetryCount < maxAdvertisingRetries && errorCode != AdvertiseCallback.ADVERTISE_FAILED_ALREADY_STARTED) {
+                advertisingRetryCount++
+                val delayMs = 2000L * advertisingRetryCount // Exponential backoff
+                Log.d(tag, "Retrying advertising in ${delayMs}ms (attempt $advertisingRetryCount/$maxAdvertisingRetries)")
+                
+                advertisingRetryHandler = Handler(Looper.getMainLooper())
+                advertisingRetryHandler?.postDelayed({
+                    if (!isAdvertising && bluetoothAdapter?.isEnabled == true) {
+                        val deviceName = bluetoothAdapter?.name ?: "Offlink"
+                        startAdvertising(deviceName)
+                    }
+                }, delayMs)
+            } else {
+                Log.e(tag, "Max advertising retries reached or already started, giving up")
+                advertisingRetryCount = 0
+            }
         }
     }
 
