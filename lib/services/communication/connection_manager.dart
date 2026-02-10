@@ -3,9 +3,11 @@ import 'dart:io';
 import 'package:device_info_plus/device_info_plus.dart';
 import '../../core/constants.dart';
 import '../../models/device_model.dart';
+import '../../models/message_model.dart';
 import '../../utils/logger.dart';
 import '../storage/scan_log_storage.dart';
 import '../storage/device_storage.dart';
+import '../storage/message_storage.dart';
 import 'ble_peripheral_service.dart';
 import 'bluetooth_service.dart';
 import 'wifi_direct_service.dart';
@@ -36,6 +38,10 @@ class ConnectionManager {
     _nativeScanSubscription = _blePeripheralService.scanResults.listen((result) {
       _handleNativeScanResult(result);
     });
+    
+    // NOTE: Connection state listener will be set up in _ensurePeripheralStarted()
+    // after BlePeripheralService is initialized, because the EventChannel stream
+    // needs to be active first. Setting it up here (before init) won't work.
   }
 
   final BluetoothService _bluetoothService = BluetoothService();
@@ -60,10 +66,12 @@ class ConnectionManager {
   bool _isInitialized = false;
   bool _useNativeScanner = false;  // Flag to use native scanner
   bool _nativeScannerFailed = false;
+  bool _isPeripheralConnection = false;  // Track if we're connected as peripheral
 
   StreamSubscription<List<DeviceModel>>? _bleDiscoverySubscription;
   StreamSubscription<List<DeviceModel>>? _wifiDiscoverySubscription;
   StreamSubscription<Map<String, dynamic>>? _nativeScanSubscription;
+  StreamSubscription<Map<String, dynamic>>? _peripheralConnectionStateSubscription;
 
   Stream<ConnectionState> get connectionState => _connectionController.stream;
   Stream<String> get incomingMessages => _messageController.stream;
@@ -86,6 +94,12 @@ class ConnectionManager {
       });
 
       _wifiDirectService.incomingMessages.listen((message) {
+        _messageController.add(message);
+      });
+
+      // Listen for messages from peripheral (when we receive as GATT server)
+      _blePeripheralService.incomingMessages.listen((message) {
+        Logger.info('Message received via BlePeripheralService (peripheral): $message');
         _messageController.add(message);
       });
 
@@ -148,6 +162,14 @@ class ConnectionManager {
   Future<void> startScan({bool useBle = true, bool useWifiDirect = false}) async {
     bool advertisingWasStopped = false;
     try {
+      // CRITICAL: Don't scan if we have an active peripheral connection
+      // Scanning will disconnect the central that's connected to us
+      if (_isPeripheralConnection && _connectedDevice != null) {
+        Logger.warning('⚠️ Cannot scan: Active peripheral connection to ${_connectedDevice!.name}');
+        Logger.warning('⚠️ Scanning would disconnect the connected central. Use existing connection to send messages.');
+        throw Exception('Cannot scan while peripheral connection is active. Device ${_connectedDevice!.name} is already connected.');
+      }
+      
       // Clear previous results
       _nativeScanDevices.clear();
       
@@ -298,6 +320,129 @@ class ConnectionManager {
     }
   }
 
+  // Handle peripheral connection state changes (when a central connects/disconnects from our GATT server)
+  void _handlePeripheralConnectionState(Map<String, dynamic> state) {
+    try {
+      print('=== 🔵 [CONN_MGR] PERIPHERAL CONNECTION STATE EVENT ===');
+      print('🔵 [CONN_MGR] State data: $state');
+      Logger.info('=== 🔵 PERIPHERAL CONNECTION STATE EVENT ===');
+      Logger.info('State data: $state');
+      
+      final isConnected = state['connected'] as bool? ?? false;
+      final deviceAddress = state['deviceAddress'] as String? ?? '';
+      final deviceName = state['deviceName'] as String? ?? 'Unknown Device';
+      
+      if (isConnected) {
+        Logger.info('🔵 Central connected to our GATT server: $deviceName ($deviceAddress)');
+        
+        // Find UUID from received messages
+        // When we receive: senderId = their UUID, receiverId = our MAC
+        String? deviceUuid;
+        final allMessages = MessageStorage.getAllMessages();
+        
+        // Get most recent received message where senderId is a UUID
+        // Sort by timestamp, most recent first
+        final sortedMessages = List<MessageModel>.from(allMessages);
+        sortedMessages.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+        
+        // Look for the most recent message we received (isSent = false)
+        // The senderId in that message is the UUID of the device that sent it
+        for (final message in sortedMessages) {
+          if (!message.isSent) {
+            // This is a received message
+            // senderId is the UUID of the device that sent it
+            // receiverId is our MAC address (when we receive)
+            if (!message.senderId.contains(':')) {
+              // senderId is a UUID (no colons)
+              deviceUuid = message.senderId;
+              Logger.info('✅ Found device UUID from most recent received message: $deviceUuid');
+              break;
+            }
+          }
+        }
+        
+        // Strategy 2: If still no UUID, check discovered devices for matching MAC
+        if (deviceUuid == null) {
+          for (final device in _bleDevices) {
+            if (device.address == deviceAddress && !device.id.contains(':')) {
+              deviceUuid = device.id;
+              Logger.info('✅ Found device UUID from discovered devices: $deviceUuid');
+              break;
+            }
+          }
+        }
+        
+        // Strategy 3: Check native scan devices
+        if (deviceUuid == null) {
+          for (final device in _nativeScanDevices.values) {
+            if (device.address == deviceAddress && !device.id.contains(':')) {
+              deviceUuid = device.id;
+              Logger.info('✅ Found device UUID from native scan: $deviceUuid');
+              break;
+            }
+          }
+        }
+        
+        // If still no UUID, use MAC address as fallback
+        final finalDeviceId = deviceUuid ?? deviceAddress;
+        if (deviceUuid == null) {
+          Logger.warning('⚠️ Could not find UUID for connected device, using MAC address: $deviceAddress');
+        }
+        
+        // Get stored name if available
+        final storedName = DeviceStorage.getDeviceDisplayName(finalDeviceId);
+        final finalDeviceName = storedName ?? 
+                                (deviceName != 'Unknown Device' ? deviceName : finalDeviceId);
+        
+        // Create device model
+        final device = DeviceModel(
+          id: finalDeviceId,
+          name: finalDeviceName,
+          address: deviceAddress,
+          type: DeviceType.ble,
+          isConnected: true,
+        );
+        
+        // Update connection state
+        _connectedDevice = device;
+        _currentConnectionType = ConnectionType.ble;
+        _isPeripheralConnection = true;  // Mark as peripheral connection
+        _connectionController.add(ConnectionState.connected);
+        
+        print('✅✅✅ [CONN_MGR] Peripheral connection TRACKED: $finalDeviceName ($finalDeviceId)');
+        print('   [CONN_MGR] Device address: $deviceAddress');
+        print('   [CONN_MGR] Connection type: peripheral (central connected to us)');
+        Logger.info('✅✅✅ Peripheral connection TRACKED: $finalDeviceName ($finalDeviceId)');
+        Logger.info('   Device address: $deviceAddress');
+        Logger.info('   Connection type: peripheral (central connected to us)');
+        
+        // Store device name if we got a proper name
+        if (deviceName.isNotEmpty && 
+            deviceName != 'Unknown Device' && 
+            deviceName != finalDeviceId &&
+            !finalDeviceId.contains(':')) {
+          unawaited(DeviceStorage.setDeviceDisplayName(finalDeviceId, deviceName));
+        }
+      } else {
+        Logger.info('🔴 Central disconnected from our GATT server: $deviceName ($deviceAddress)');
+        
+        // Only disconnect if this was the connected device
+        if (_isPeripheralConnection && 
+            _connectedDevice != null && 
+            (_connectedDevice!.address == deviceAddress || _connectedDevice!.id == deviceAddress)) {
+          _currentConnectionType = ConnectionType.none;
+          _connectedDevice = null;
+          _isPeripheralConnection = false;
+          _connectionController.add(ConnectionState.disconnected);
+          
+          Logger.info('🔴 Peripheral connection closed');
+        }
+      }
+    } catch (e, stackTrace) {
+      Logger.error('❌ Error handling peripheral connection state', e, stackTrace);
+    }
+  }
+
   Future<void> stopScan() async {
     try {
       await _bluetoothService.stopScan();
@@ -342,6 +487,7 @@ class ConnectionManager {
         connected = await _bluetoothService.connectToDevice(device);
         if (connected) {
           _currentConnectionType = ConnectionType.ble;
+          _isPeripheralConnection = false;  // This is a central connection
           final connectedDevice = _bluetoothService.getConnectedDevice();
           _connectedDevice = connectedDevice;
           
@@ -395,13 +541,21 @@ class ConnectionManager {
   Future<void> disconnect() async {
     try {
       if (_currentConnectionType == ConnectionType.ble) {
-        await _bluetoothService.disconnect();
+        if (_isPeripheralConnection) {
+          // For peripheral connections, we can't actively disconnect the central
+          // The central will disconnect itself. We just clear our state.
+          Logger.info('Clearing peripheral connection state (central will disconnect)');
+        } else {
+          // Central connection - actively disconnect
+          await _bluetoothService.disconnect();
+        }
       } else if (_currentConnectionType == ConnectionType.wifiDirect) {
         await _wifiDirectService.disconnect();
       }
 
       _currentConnectionType = ConnectionType.none;
       _connectedDevice = null;
+      _isPeripheralConnection = false;
       _connectionController.add(ConnectionState.disconnected);
       
       // Restart advertising after disconnection so we can be discovered again
@@ -418,7 +572,15 @@ class ConnectionManager {
   Future<bool> sendMessage(String message) async {
     try {
       if (_currentConnectionType == ConnectionType.ble) {
-        return await _bluetoothService.sendMessage(message);
+        if (_isPeripheralConnection) {
+          // We have a central connected to our GATT server → send via peripheral
+          Logger.info('Sending message via peripheral (GATT server)');
+          return await _blePeripheralService.sendMessage(message);
+        } else {
+          // We are central → use BluetoothService
+          Logger.info('Sending message via central (BLE client)');
+          return await _bluetoothService.sendMessage(message);
+        }
       } else if (_currentConnectionType == ConnectionType.wifiDirect) {
         return await _wifiDirectService.sendMessage(message);
       } else {
@@ -451,6 +613,7 @@ class ConnectionManager {
     _bleDiscoverySubscription?.cancel();
     _wifiDiscoverySubscription?.cancel();
     _nativeScanSubscription?.cancel();
+    _peripheralConnectionStateSubscription?.cancel();
     _connectionController.close();
     _messageController.close();
     _deviceStreamController.close();
@@ -487,6 +650,32 @@ class ConnectionManager {
           characteristicUuid: AppConstants.bleCharacteristicUuid,
           deviceUuid: deviceUuid,
         );
+        
+        // IMPORTANT: Ensure connection state listener is active after initialization
+        // The EventChannel stream is set up in BlePeripheralService.initialize(),
+        // so we just need to listen to it here
+        if (_peripheralInitialized) {
+          // Cancel existing subscription if any
+          _peripheralConnectionStateSubscription?.cancel();
+          // Listen to the connection state stream (EventChannel is now active)
+          print('🔵 [CONN_MGR] Setting up connection state listener in ConnectionManager...');
+          Logger.info('🔵 Setting up connection state listener in ConnectionManager...');
+          _peripheralConnectionStateSubscription = _blePeripheralService.connectionState.listen(
+            (state) {
+              print('🔵🔵 [CONN_MGR] Connection state event received: $state');
+              Logger.info('🔵🔵 Connection state event received in ConnectionManager: $state');
+              _handlePeripheralConnectionState(state);
+            },
+            onError: (error) {
+              Logger.error('❌ Error in peripheral connection state stream', error);
+            },
+            onDone: () {
+              Logger.warning('🔵 Connection state stream closed in ConnectionManager');
+            },
+          );
+          Logger.info('✅ Peripheral connection state listener set up in ConnectionManager');
+        }
+        
         if (_peripheralInitialized && !_peripheralListening) {
           _blePeripheralService.incomingMessages.listen((message) {
             Logger.info('Message received via BlePeripheralService (peripheral): $message');

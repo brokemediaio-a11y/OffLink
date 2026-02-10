@@ -53,6 +53,9 @@ class BlePeripheralManager(private val context: Context) {
     private var isAdvertising = false
     private var advertisingError: Int? = null
     
+    // Connection state listener for peripheral mode
+    private var connectionStateListener: ((Map<String, Any>) -> Unit)? = null
+    
     // Native scanner components
     private var bleScanner: BluetoothLeScanner? = null
     private var nativeScanCallback: ScanCallback? = null
@@ -74,6 +77,10 @@ class BlePeripheralManager(private val context: Context) {
     
     fun setScanResultListener(listener: ((Map<String, Any>) -> Unit)?) {
         scanResultListener = listener
+    }
+    
+    fun setConnectionStateListener(listener: ((Map<String, Any>) -> Unit)?) {
+        connectionStateListener = listener
     }
 
     fun initialize(serviceUuidString: String, characteristicUuidString: String, deviceUuidString: String?): Boolean {
@@ -806,9 +813,35 @@ class BlePeripheralManager(private val context: Context) {
             if (newState == BluetoothGatt.STATE_CONNECTED) {
                 connectedDevices.add(device)
                 Log.d(tag, "Central connected: ${device.address}")
+                // Notify Dart about the connection
+                if (connectionStateListener != null) {
+                    Log.d(tag, "🔵 Connection state listener is NOT null, sending event to Dart")
+                    val stateMap = mapOf(
+                        "connected" to true,
+                        "deviceAddress" to device.address,
+                        "deviceName" to (device.name ?: "Unknown Device")
+                    )
+                    Log.d(tag, "🔵 Sending connection state event: $stateMap")
+                    connectionStateListener?.invoke(stateMap)
+                    Log.d(tag, "✅ Connection state event sent to listener")
+                } else {
+                    Log.w(tag, "⚠️⚠️⚠️ Connection state listener is NULL! Event will be lost.")
+                    Log.w(tag, "⚠️ Device ${device.address} connected but Dart won't be notified!")
+                }
             } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
                 connectedDevices.remove(device)
                 Log.d(tag, "Central disconnected: ${device.address}")
+                if (connectionStateListener != null) {
+                    Log.d(tag, "🔵 Connection state listener is NOT null, sending disconnect event")
+                    val stateMap = mapOf(
+                        "connected" to false,
+                        "deviceAddress" to device.address,
+                        "deviceName" to (device.name ?: "Unknown Device")
+                    )
+                    connectionStateListener?.invoke(stateMap)
+                } else {
+                    Log.w(tag, "⚠️⚠️⚠️ Connection state listener is NULL! Disconnect event will be lost.")
+                }
             }
         }
         override fun onCharacteristicWriteRequest(

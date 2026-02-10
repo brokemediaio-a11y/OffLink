@@ -11,17 +11,21 @@ class BlePeripheralService {
   static const _channel = MethodChannel('com.offlink.ble_peripheral');
   static const _messageChannel = EventChannel('com.offlink.ble_peripheral/messages');
   static const _scanResultChannel = EventChannel('com.offlink.ble_peripheral/scan_results');
+  static const _connectionStateChannel = EventChannel('com.offlink.ble_peripheral/connection_state');
   
   final _messageController = StreamController<String>.broadcast();
   final _scanResultController = StreamController<Map<String, dynamic>>.broadcast();
+  final _connectionStateController = StreamController<Map<String, dynamic>>.broadcast();
   
   StreamSubscription? _messageSubscription;
   StreamSubscription? _scanResultSubscription;
+  StreamSubscription? _connectionStateSubscription;
   
   bool _initialized = false;
 
   Stream<String> get incomingMessages => _messageController.stream;
   Stream<Map<String, dynamic>> get scanResults => _scanResultController.stream;
+  Stream<Map<String, dynamic>> get connectionState => _connectionStateController.stream;
 
   Future<bool> initialize({
     required String serviceUuid,
@@ -69,7 +73,60 @@ class BlePeripheralService {
           },
         );
         
-        Logger.info('BLE peripheral service initialized');
+        // Set up connection state listener
+        _connectionStateSubscription?.cancel();
+        print('🔵 [BLE_PERIPHERAL] Setting up connection state EventChannel listener...');
+        Logger.info('🔵 Setting up connection state EventChannel listener...');
+        
+        // Try to set up the listener with error handling
+        try {
+          _connectionStateSubscription = _connectionStateChannel.receiveBroadcastStream().listen(
+            (state) {
+              print('🔵🔵🔵 [BLE_PERIPHERAL] Connection state event received: $state');
+              Logger.info('🔵🔵🔵 Connection state event received in BlePeripheralService: $state');
+              if (state is Map) {
+                print('🔵 [BLE_PERIPHERAL] Adding to connection state controller');
+                Logger.info('🔵 Adding to connection state controller');
+                _connectionStateController.add(Map<String, dynamic>.from(state));
+              } else {
+                Logger.warning('🔵 Connection state event is not a Map: ${state.runtimeType}');
+              }
+            },
+            onError: (error) {
+              Logger.error('❌ Error in connection state stream', error);
+            },
+            onDone: () {
+              Logger.warning('🔵 Connection state stream closed');
+            },
+            cancelOnError: false, // Don't cancel on error
+          );
+          print('✅ [BLE_PERIPHERAL] Connection state EventChannel listener set up successfully');
+          Logger.info('✅ Connection state EventChannel listener set up successfully');
+        } catch (e) {
+          Logger.error('❌ Failed to set up connection state listener: $e');
+          // Retry after a short delay
+          Future.delayed(const Duration(milliseconds: 100), () {
+            try {
+              Logger.info('🔄 Retrying connection state listener setup...');
+              _connectionStateSubscription = _connectionStateChannel.receiveBroadcastStream().listen(
+                (state) {
+                  Logger.info('🔵🔵🔵 Connection state event received (retry): $state');
+                  if (state is Map) {
+                    _connectionStateController.add(Map<String, dynamic>.from(state));
+                  }
+                },
+                onError: (error) {
+                  Logger.error('❌ Error in connection state stream (retry)', error);
+                },
+              );
+              Logger.info('✅ Connection state listener set up on retry');
+            } catch (e2) {
+              Logger.error('❌ Failed to set up connection state listener on retry: $e2');
+            }
+          });
+        }
+        
+        Logger.info('✅ BLE peripheral service initialized with connection state listener');
       }
       
       return _initialized;
@@ -183,7 +240,9 @@ class BlePeripheralService {
   void dispose() {
     _messageSubscription?.cancel();
     _scanResultSubscription?.cancel();
+    _connectionStateSubscription?.cancel();
     _messageController.close();
     _scanResultController.close();
+    _connectionStateController.close();
   }
 }

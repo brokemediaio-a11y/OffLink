@@ -345,22 +345,73 @@ class BluetoothService {
         Logger.error('Cannot connect: device has no MAC address');
         return false;
       }
-      final bluetoothDevice = fbp.BluetoothDevice.fromId(connectionAddress);
+      
+      // Normalize MAC address format (remove any colons/spaces, ensure uppercase)
+      String normalizedAddress = connectionAddress.toUpperCase().replaceAll(RegExp(r'[:\s-]'), '');
+      // Re-add colons for flutter_blue_plus format (XX:XX:XX:XX:XX:XX)
+      if (normalizedAddress.length == 12) {
+        normalizedAddress = normalizedAddress.replaceAllMapped(
+          RegExp(r'(.{2})'),
+          (match) => '${match.group(1)}:',
+        ).substring(0, 17); // Remove trailing colon
+      }
+      
+      Logger.info('Connecting to device: ${device.name}');
+      Logger.info('  Original address: $connectionAddress');
+      Logger.info('  Normalized address: $normalizedAddress');
+      Logger.info('  Device ID (UUID): ${device.id}');
+      
+      final bluetoothDevice = fbp.BluetoothDevice.fromId(normalizedAddress);
 
-      // Connect to device
-      Logger.info('Attempting to connect to ${device.name} (UUID: ${device.id}, MAC: $connectionAddress)');
-      print('[OFFLINK] Attempting to connect to ${device.name} ($connectionAddress)');
-      await bluetoothDevice.connect(
-        timeout: AppConstants.connectionTimeout,
-        autoConnect: false,
-      );
+      // Connect to device with retry logic for bonded devices
+      Logger.info('Attempting to connect to ${device.name} (UUID: ${device.id}, MAC: $normalizedAddress)');
+      print('[OFFLINK] Attempting to connect to ${device.name} ($normalizedAddress)');
+      
+      int retryCount = 0;
+      const maxRetries = 2;
+      bool connected = false;
+      
+      while (retryCount <= maxRetries && !connected) {
+        try {
+          if (retryCount > 0) {
+            Logger.info('Retrying connection (attempt ${retryCount + 1}/${maxRetries + 1})...');
+            await Future.delayed(Duration(milliseconds: 1000 * retryCount)); // Exponential backoff
+          }
+          
+          await bluetoothDevice.connect(
+            timeout: AppConstants.connectionTimeout,
+            autoConnect: false,
+          );
+          connected = true;
+        } catch (e) {
+          Logger.warning('Connection attempt ${retryCount + 1} failed: $e');
+          if (retryCount < maxRetries) {
+            retryCount++;
+            // Disconnect if partially connected
+            try {
+              await bluetoothDevice.disconnect();
+              await Future.delayed(const Duration(milliseconds: 500));
+            } catch (_) {
+              // Ignore disconnect errors
+            }
+          } else {
+            Logger.error('All connection attempts failed');
+            rethrow;
+          }
+        }
+      }
+      
+      if (!connected) {
+        Logger.error('Failed to connect after ${maxRetries + 1} attempts');
+        return false;
+      }
 
       Logger.info('Connection established to ${device.name}');
       print('[OFFLINK] Connection established to ${device.name}');
       _connectedDevice = bluetoothDevice;
 
-      // Wait a moment for connection to stabilize
-      await Future.delayed(const Duration(milliseconds: 200));
+      // Wait a moment for connection to stabilize (longer for bonded devices)
+      await Future.delayed(const Duration(milliseconds: 500));
 
       // Check connection state before discovering services
       final connectionState = await bluetoothDevice.connectionState.first.timeout(

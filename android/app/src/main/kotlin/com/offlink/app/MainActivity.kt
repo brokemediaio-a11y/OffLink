@@ -17,11 +17,13 @@ class MainActivity : FlutterActivity() {
     private val permissionsChannelName = "com.offlink.permissions"
     private val eventChannelName = "com.offlink.ble_peripheral/messages"
     private val scanEventChannelName = "com.offlink.ble_peripheral/scan_results"
+    private val connectionStateChannelName = "com.offlink.ble_peripheral/connection_state"
     
     private val blePeripheralManager by lazy { BlePeripheralManager(applicationContext) }
     private val mainHandler = Handler(Looper.getMainLooper())
     private var messageSink: EventChannel.EventSink? = null
     private var scanResultSink: EventChannel.EventSink? = null
+    private var connectionStateSink: EventChannel.EventSink? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -174,6 +176,36 @@ class MainActivity : FlutterActivity() {
             override fun onCancel(arguments: Any?) {
                 scanResultSink = null
                 blePeripheralManager.setScanResultListener(null)
+            }
+        })
+        
+        // Connection State Event Channel
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            connectionStateChannelName
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                android.util.Log.d("MainActivity", "🔵 Connection state EventChannel: onListen called")
+                connectionStateSink = events
+                android.util.Log.d("MainActivity", "🔵 Setting connection state listener in BlePeripheralManager")
+                blePeripheralManager.setConnectionStateListener { state ->
+                    android.util.Log.d("MainActivity", "🔵 Connection state event received from BlePeripheralManager: $state")
+                    mainHandler.post {
+                        if (connectionStateSink != null) {
+                            connectionStateSink?.success(state)
+                            android.util.Log.d("MainActivity", "✅ Connection state event sent to Dart successfully")
+                        } else {
+                            android.util.Log.w("MainActivity", "⚠️⚠️⚠️ Connection state sink is NULL! Event lost!")
+                        }
+                    }
+                }
+                android.util.Log.d("MainActivity", "✅ Connection state listener set up in native")
+            }
+
+            override fun onCancel(arguments: Any?) {
+                android.util.Log.d("MainActivity", "🔵 Connection state EventChannel: onCancel called")
+                connectionStateSink = null
+                blePeripheralManager.setConnectionStateListener(null)
             }
         })
     }

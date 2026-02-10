@@ -99,62 +99,25 @@ class ChatNotifier extends StateNotifier<ChatState> {
       
       Logger.info('Sending message: receiverId=$finalReceiverId, _otherDeviceId=$_otherDeviceId, provided receiverId=$receiverId');
       
-      // Check if we're connected to the target device
-      // IMPORTANT: If we're already connected, assume it's the right device
-      // The connection was established when opening the chat, so we should trust it
+      // Check if we're connected to any device
+      // IMPORTANT: If we're already connected (as central OR peripheral), use that connection
+      // This allows replies to work even when we're in peripheral mode (central connected to us)
       final connectionState = _ref.read(connectionProvider);
       final isConnected = connectionState.state == ConnectionStateType.connected;
       
-      // If connected, check if it's the right device
-      // Handle UUID vs MAC address matching - but be lenient if already connected
-      bool isCorrectDevice = false;
+      Logger.info('Connection check: isConnected=$isConnected');
       if (isConnected && connectionState.connectedDevice != null) {
-        final connectedDevice = connectionState.connectedDevice!;
-        // Match by ID or address (handles UUID vs MAC)
-        isCorrectDevice = connectedDevice.id == finalReceiverId ||
-                         connectedDevice.address == finalReceiverId ||
-                         connectedDevice.id == receiverId ||
-                         connectedDevice.address == receiverId ||
-                         // Also check if _otherDevice matches
-                         (_otherDevice != null && (
-                           connectedDevice.id == _otherDevice!.id ||
-                           connectedDevice.address == _otherDevice!.address ||
-                           connectedDevice.id == _otherDevice!.address ||
-                           connectedDevice.address == _otherDevice!.id
-                         ));
-        
-        // IMPORTANT: If we're connected but device IDs don't match exactly,
-        // still assume it's correct if we're in a chat screen (user already connected)
-        // This prevents unnecessary disconnection and reconnection
-        if (!isCorrectDevice && _otherDevice != null) {
-          // Check if the connected device's MAC matches _otherDevice's address
-          // or if they're both "Offlink" devices (likely the same device)
-          if (connectedDevice.name.toLowerCase().contains('offlink') &&
-              _otherDevice!.name.toLowerCase().contains('offlink')) {
-            isCorrectDevice = true;
-            Logger.info('Assuming correct device based on name match (both Offlink)');
-          }
-        }
-        
-        Logger.info('Connection check: isConnected=$isConnected, isCorrectDevice=$isCorrectDevice');
-        Logger.info('  connectedDevice: id=${connectedDevice.id}, address=${connectedDevice.address}, name=${connectedDevice.name}');
+        Logger.info('  connectedDevice: id=${connectionState.connectedDevice!.id}, address=${connectionState.connectedDevice!.address}, name=${connectionState.connectedDevice!.name}');
         Logger.info('  finalReceiverId: $finalReceiverId, receiverId: $receiverId');
-        Logger.info('  _otherDevice: id=${_otherDevice?.id}, address=${_otherDevice?.address}, name=${_otherDevice?.name}');
-      }
-      
-      // Only try to connect if not connected
-      // IMPORTANT: If already connected, assume it's the correct device
-      // Don't disconnect and reconnect just because IDs don't match exactly
-      // The user already connected when opening the chat, so trust that connection
-      final shouldConnect = !isConnected;
-      
-      if (isConnected && !isCorrectDevice) {
-        Logger.warning('Connected but device IDs don\'t match exactly. Assuming correct device since user already connected.');
-        Logger.warning('  This is normal when UUID (conversation) vs MAC (BLE connection) formats differ.');
       }
 
-      // If not connected or connected to wrong device, try to auto-connect by scanning
-      if (shouldConnect) {
+      // If already connected, skip scanning and just send the message
+      // This works for both central and peripheral connections
+      if (isConnected) {
+        Logger.info('Already connected (central or peripheral). Will send message to: $finalReceiverId');
+        // Continue to message sending logic below
+      } else {
+        // Not connected - try to auto-connect by scanning
         Logger.info('Not connected to device. Scanning and attempting auto-connection...');
         state = state.copyWith(
           isSending: true,
@@ -224,10 +187,6 @@ class ChatNotifier extends StateNotifier<ChatState> {
           Logger.error('Target device not found during scan. ReceiverId: $finalReceiverId');
           return;
         }
-      } else {
-        // We're already connected - but still use _otherDeviceId to ensure we reply to the correct UUID
-        // Don't change finalReceiverId - it's already set to _otherDeviceId at the start
-        Logger.info('Already connected. Will reply to: $finalReceiverId');
       }
 
       final message = MessageModel(
